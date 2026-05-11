@@ -166,7 +166,7 @@ async fn main() -> Result<()> {
     let num_threads = std::env::var("MINER_THREADS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or_else(num_cpus::get);
+        .unwrap_or_else(|| num_cpus::get().saturating_sub(1).max(1));
 
     println!("🔨 HASH Miner initialized");
     println!("📍 Miner Address: {}", miner_address);
