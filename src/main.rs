@@ -59,8 +59,6 @@ struct Solution {
 #[inline]
 fn check_proof(challenge: &B256, nonce: U256, difficulty: U256) -> bool {
     // Contract: keccak256(abi.encode(bytes32 challenge, uint256 nonce))
-    // For bytes32 + uint256, abi.encode produces exactly 64 packed bytes
-    // (each field is already 32 bytes, no padding needed).
     let mut buf = [0u8; 64];
     buf[..32].copy_from_slice(challenge.as_slice());
     buf[32..].copy_from_slice(&nonce.to_be_bytes::<32>());
@@ -68,8 +66,7 @@ fn check_proof(challenge: &B256, nonce: U256, difficulty: U256) -> bool {
     U256::from_be_bytes::<32>(hash.0) < difficulty
 }
 
-/// Run N CPU workers in a scoped thread pool. Each thread iterates nonces with
-/// stride = num_threads so no two threads ever hash the same nonce.
+/// Run N CPU workers in a scoped thread pool.
 fn run_workers(
     challenge: B256,
     difficulty: U256,
@@ -140,8 +137,8 @@ async fn main() -> Result<()> {
     // Load .env if present (ignore if missing — env vars still work).
     let _ = dotenvy::dotenv();
 
-    println!("🔐 HASH Token CPU Miner (Rust)");
-    println!("================================\n");
+    println!("🔐 HASH Token Miner (Rust) — Multi-GPU Edition");
+    println!("================================================\n");
 
     let raw_key = match std::env::var("PRIVATE_KEY") {
         Ok(v) => v,
@@ -174,7 +171,7 @@ async fn main() -> Result<()> {
     println!("🔨 HASH Miner initialized");
     println!("📍 Miner Address: {}", miner_address);
     println!("⛽ RPC URL: {}", rpc_url_str);
-    println!("🧵 Worker threads: {}", num_threads);
+    println!("🧵 CPU Worker threads: {}", num_threads);
 
     // --- Initial info via miningState() (one RPC call instead of four) ---
     match contract.miningState().call().await {
@@ -201,19 +198,26 @@ async fn main() -> Result<()> {
         Err(e) => eprintln!("⚠️  Could not verify genesisComplete: {e}"),
     }
 
-    // --- Optional GPU backend ---
+    // --- Optional GPU backend (MULTI-GPU) ---
     let gpu_enabled = std::env::var("GPU").ok().as_deref() == Some("1");
+    let gpu_index: Option<usize> = std::env::var("GPU_INDEX")
+        .ok()
+        .and_then(|s| s.parse().ok());
+
     #[cfg(feature = "gpu")]
     let gpu_miner: Option<Arc<gpu::GpuMiner>> = if gpu_enabled {
         let batch = std::env::var("GPU_BATCH")
             .ok()
             .and_then(|s| s.parse::<usize>().ok());
-        match gpu::GpuMiner::new(batch) {
+        match gpu::GpuMiner::new(batch, gpu_index) {
             Ok(g) => {
-                println!("🎮 GPU device: {}", g.device_name());
-                println!("🎮 GPU batch size: {} nonces/dispatch", g.batch_size());
+                println!("\n🎮 GPU Mining — {} device(s) detected:", g.device_count());
+                for (i, name) in g.device_names().iter().enumerate() {
+                    println!("   GPU {}: {}", i, name);
+                }
+                println!("   Batch size: {} nonces/dispatch/GPU", g.batch_size());
                 match g.self_test() {
-                    Ok(()) => println!("✅ GPU self-test passed"),
+                    Ok(()) => println!("✅ All GPU self-tests passed"),
                     Err(e) => return Err(eyre!("GPU self-test FAILED — aborting: {e}")),
                 }
                 Some(Arc::new(g))
@@ -261,7 +265,7 @@ async fn main() -> Result<()> {
         };
         let epoch: u64 = block_num / EPOCH_BLOCKS;
 
-        // --- Fetch challenge from contract (avoids any encoding mistakes) ---
+        // --- Fetch challenge from contract ---
         let challenge = match contract.getChallenge(miner_address).call().await {
             Ok(v) => v._0,
             Err(e) => {
@@ -281,20 +285,28 @@ async fn main() -> Result<()> {
         };
 
         let backend = if gpu_miner.is_some() { "GPU" } else { "CPU" };
+        #[cfg(feature = "gpu")]
+        let gpu_count = gpu_miner.as_ref().map(|g| g.device_count()).unwrap_or(0);
+        #[cfg(not(feature = "gpu"))]
+        let gpu_count = 0usize;
+
         println!("\n📊 Round start:");
         println!("   Block: {}  Epoch: {}", block_num, epoch);
         println!("   Difficulty: {}", difficulty);
         println!("   Challenge: 0x{}...", hex_short(challenge.as_slice()));
-        println!("⛏️  Mining epoch {} on {} ({} threads)...", epoch, backend, num_threads);
+        if gpu_count > 1 {
+            println!("⛏️  Mining epoch {} on {} ({} GPUs)...", epoch, backend, gpu_count);
+        } else {
+            println!("⛏️  Mining epoch {} on {} ({} threads)...", epoch, backend, num_threads);
+        }
 
-        // u64 random start works for both backends; CPU widens via U256::from.
         let start_nonce_u64: u64 = rand::thread_rng().gen();
         let start_nonce = U256::from(start_nonce_u64);
 
         let stop_flag = Arc::new(AtomicBool::new(false));
         let attempts_counter = Arc::new(AtomicU64::new(0));
 
-        // --- Watchdog: stats display + epoch poll via block number ---
+        // --- Watchdog: stats display + epoch poll ---
         let watchdog = {
             let stop_flag = Arc::clone(&stop_flag);
             let attempts_counter = Arc::clone(&attempts_counter);
@@ -351,7 +363,7 @@ async fn main() -> Result<()> {
             })
         };
 
-        // --- Mining (GPU if available, else CPU thread pool) ---
+        // --- Mining (Multi-GPU if available, else CPU thread pool) ---
         let mining_result: Option<Solution> = {
             let stop_flag = Arc::clone(&stop_flag);
             let attempts_counter = Arc::clone(&attempts_counter);
@@ -411,10 +423,6 @@ async fn main() -> Result<()> {
         println!("🎉 FOUND VALID NONCE: {} (epoch {})", sol.nonce, sol.epoch);
 
         // --- Gas tuning (EIP-1559) ---
-        // PRIORITY_GWEI: tip you actually pay miners (default 5 gwei — aggressive).
-        // MAX_FEE_GWEI:  absolute ceiling; you only pay this if base_fee spikes.
-        //                Effective gas = min(MAX_FEE, base_fee + PRIORITY).
-        // GAS_LIMIT_OVERRIDE: optional fixed gas limit.
         let priority_gwei: f64 = std::env::var("PRIORITY_GWEI")
             .ok()
             .and_then(|s| s.parse().ok())

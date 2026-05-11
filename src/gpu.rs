@@ -1,8 +1,7 @@
-//! GPU mining backend via OpenCL.
+//! GPU mining backend via OpenCL — **Multi-GPU** support.
 //!
-//! Builds a single program/kernel up-front, then `mine_batch` repeatedly
-//! dispatches a fixed-size grid against new nonce_base values until either
-//! a hit is found or the caller signals stop.
+//! Enumerates ALL available OpenCL devices and runs them in parallel.
+//! Each GPU gets its own queue and dispatches batches independently.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -15,121 +14,104 @@ use ocl::{flags, Buffer, Context, Device, Kernel, Platform, Program, Queue};
 const KERNEL_SRC: &str = include_str!("keccak_kernel.cl");
 const DEFAULT_BATCH: usize = 1 << 22; // 4,194,304 nonces/dispatch
 
-pub struct GpuMiner {
-    context: Context,
+/// A single GPU device context ready to mine.
+struct GpuDevice {
     queue: Queue,
     program: Program,
     device_name: String,
     batch_size: usize,
 }
 
+/// Multi-GPU miner — holds all detected GPU devices.
+pub struct GpuMiner {
+    devices: Vec<GpuDevice>,
+    batch_size: usize,
+}
+
 impl GpuMiner {
-    pub fn new(batch_size: Option<usize>) -> Result<Self> {
+    /// Initialize ALL available OpenCL GPUs.
+    /// If `gpu_index` is Some, only use that specific device index.
+    pub fn new(batch_size: Option<usize>, gpu_index: Option<usize>) -> Result<Self> {
         let batch_size = batch_size.unwrap_or(DEFAULT_BATCH);
 
         let platform = Platform::default();
-        let device = Device::first(platform)
-            .map_err(|e| eyre!("no OpenCL device found: {e}"))?;
-        let device_name = device.name().unwrap_or_else(|_| "<unknown>".into());
+        let all_devices = Device::list_all(platform)
+            .map_err(|e| eyre!("failed to list OpenCL devices: {e}"))?;
 
-        let context = Context::builder()
-            .platform(platform)
-            .devices(device)
-            .build()?;
-        let queue = Queue::new(&context, device, None)?;
-        let program = Program::builder()
-            .src(KERNEL_SRC)
-            .devices(device)
-            .build(&context)?;
+        if all_devices.is_empty() {
+            return Err(eyre!("no OpenCL devices found"));
+        }
 
-        Ok(Self {
-            context,
-            queue,
-            program,
-            device_name,
-            batch_size,
-        })
+        let selected_devices: Vec<Device> = if let Some(idx) = gpu_index {
+            if idx >= all_devices.len() {
+                return Err(eyre!(
+                    "GPU_INDEX={} but only {} devices available",
+                    idx,
+                    all_devices.len()
+                ));
+            }
+            vec![all_devices[idx]]
+        } else {
+            all_devices
+        };
+
+        let mut devices = Vec::new();
+        for device in &selected_devices {
+            let device_name = device.name().unwrap_or_else(|_| "<unknown>".into());
+
+            let context = Context::builder()
+                .platform(platform)
+                .devices(*device)
+                .build()?;
+            let queue = Queue::new(&context, *device, None)?;
+            let program = Program::builder()
+                .src(KERNEL_SRC)
+                .devices(*device)
+                .build(&context)?;
+
+            devices.push(GpuDevice {
+                queue,
+                program,
+                device_name,
+                batch_size,
+            });
+        }
+
+        Ok(Self { devices, batch_size })
     }
 
-    pub fn device_name(&self) -> &str {
-        &self.device_name
+    pub fn device_names(&self) -> Vec<&str> {
+        self.devices.iter().map(|d| d.device_name.as_str()).collect()
+    }
+
+    pub fn device_count(&self) -> usize {
+        self.devices.len()
+    }
+
+    /// Legacy compat
+    pub fn device_name(&self) -> String {
+        self.devices
+            .iter()
+            .map(|d| d.device_name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     pub fn batch_size(&self) -> usize {
         self.batch_size
     }
 
-    /// Verify the GPU kernel matches a CPU reference on one known nonce.
-    /// Called at startup so a kernel bug never reaches production.
+    /// Self-test ALL GPUs.
     pub fn self_test(&self) -> Result<()> {
-        // Fabricate an "always-passes" difficulty (uint256::MAX) so any hash
-        // beats it — the test asserts that *which* nonce the kernel reports,
-        // not whether one exists.
-        let challenge = B256::from(*b"abcdefghijklmnopqrstuvwxyz012345");
-        let difficulty = U256::MAX;
-        let nonce_base: u64 = 12345;
-
-        // Run a 1-thread batch (global size = 1, work-item 0 gets nonce_base).
-        let (cw, dw) = (split_challenge_le(&challenge), split_difficulty_be(difficulty));
-
-        let found_nonce = Buffer::<u64>::builder()
-            .queue(self.queue.clone())
-            .flags(flags::MEM_READ_WRITE)
-            .len(1)
-            .copy_host_slice(&[0u64])
-            .build()?;
-        let found_flag = Buffer::<i32>::builder()
-            .queue(self.queue.clone())
-            .flags(flags::MEM_READ_WRITE)
-            .len(1)
-            .copy_host_slice(&[0i32])
-            .build()?;
-
-        let kernel = Kernel::builder()
-            .program(&self.program)
-            .name("mine_keccak")
-            .queue(self.queue.clone())
-            .global_work_size(1usize)
-            .arg(cw[0]).arg(cw[1]).arg(cw[2]).arg(cw[3])
-            .arg(dw[0]).arg(dw[1]).arg(dw[2]).arg(dw[3])
-            .arg(nonce_base)
-            .arg(&found_nonce)
-            .arg(&found_flag)
-            .build()?;
-
-        unsafe { kernel.enq()?; }
-        self.queue.finish()?;
-
-        let mut flag = [0i32];
-        found_flag.read(&mut flag[..]).enq()?;
-        if flag[0] == 0 {
-            return Err(eyre!("self-test: GPU did not report any hit against MAX difficulty"));
+        for (i, dev) in self.devices.iter().enumerate() {
+            self_test_device(dev)
+                .map_err(|e| eyre!("GPU {} ({}) self-test failed: {e}", i, dev.device_name))?;
         }
-
-        let mut got = [0u64];
-        found_nonce.read(&mut got[..]).enq()?;
-        if got[0] != nonce_base {
-            return Err(eyre!(
-                "self-test: GPU reported nonce {} but expected {}",
-                got[0],
-                nonce_base
-            ));
-        }
-
-        // Now verify the hash computed against the known nonce matches the
-        // CPU reference (the same proof formula the contract uses).
-        let cpu_hash = cpu_hash(&challenge, U256::from(nonce_base));
-        if !(U256::from_be_bytes::<32>(cpu_hash.0) < difficulty) {
-            // unreachable: MAX difficulty
-            return Err(eyre!("self-test sanity: CPU hash >= MAX difficulty"));
-        }
-
         Ok(())
     }
 
-    /// Run batches until either a solution is found or `stop_flag` is set or
-    /// `attempts_budget` nonces have been hashed. Returns the winning nonce
-    /// when one is found.
+    /// Mine across ALL GPUs in parallel threads.
+    /// Each GPU gets a different nonce range (offset by device index * batch_size * large_stride).
     pub fn mine(
         &self,
         challenge: B256,
@@ -138,79 +120,199 @@ impl GpuMiner {
         stop_flag: Arc<AtomicBool>,
         attempts_counter: Arc<AtomicU64>,
     ) -> Result<Option<u64>> {
-        let cw = split_challenge_le(&challenge);
-        let dw = split_difficulty_be(difficulty);
-
-        let found_nonce = Buffer::<u64>::builder()
-            .queue(self.queue.clone())
-            .flags(flags::MEM_READ_WRITE)
-            .len(1)
-            .copy_host_slice(&[0u64])
-            .build()?;
-        let found_flag = Buffer::<i32>::builder()
-            .queue(self.queue.clone())
-            .flags(flags::MEM_READ_WRITE)
-            .len(1)
-            .copy_host_slice(&[0i32])
-            .build()?;
-
-        let mut nonce_base: u64 = start_nonce;
-        loop {
-            if stop_flag.load(Ordering::Relaxed) {
-                return Ok(None);
-            }
-
-            // Reset flag/nonce for this dispatch.
-            found_flag.write(&[0i32][..]).enq()?;
-            found_nonce.write(&[0u64][..]).enq()?;
-
-            let kernel = Kernel::builder()
-                .program(&self.program)
-                .name("mine_keccak")
-                .queue(self.queue.clone())
-                .global_work_size(self.batch_size)
-                .arg(cw[0]).arg(cw[1]).arg(cw[2]).arg(cw[3])
-                .arg(dw[0]).arg(dw[1]).arg(dw[2]).arg(dw[3])
-                .arg(nonce_base)
-                .arg(&found_nonce)
-                .arg(&found_flag)
-                .build()?;
-
-            unsafe { kernel.enq()?; }
-            self.queue.finish()?;
-
-            attempts_counter.fetch_add(self.batch_size as u64, Ordering::Relaxed);
-
-            let mut flag = [0i32];
-            found_flag.read(&mut flag[..]).enq()?;
-            if flag[0] != 0 {
-                let mut got = [0u64];
-                found_nonce.read(&mut got[..]).enq()?;
-                let nonce = got[0];
-
-                // Belt-and-braces: CPU-verify before we hand the nonce back.
-                let h = cpu_hash(&challenge, U256::from(nonce));
-                if U256::from_be_bytes::<32>(h.0) < difficulty {
-                    return Ok(Some(nonce));
-                } else {
-                    eprintln!(
-                        "⚠️  GPU reported nonce {} but CPU verify failed — skipping batch",
-                        nonce
-                    );
-                }
-            }
-
-            nonce_base = nonce_base.wrapping_add(self.batch_size as u64);
-
-            // Yield briefly so the stop_flag check has time to land.
-            // (1us is enough to not break GPU saturation.)
-            std::thread::sleep(Duration::from_micros(1));
+        let num_gpus = self.devices.len();
+        if num_gpus == 0 {
+            return Ok(None);
         }
+
+        // Single GPU — no threading overhead
+        if num_gpus == 1 {
+            return mine_on_device(
+                &self.devices[0],
+                challenge,
+                difficulty,
+                start_nonce,
+                stop_flag,
+                attempts_counter,
+            );
+        }
+
+        // Multi-GPU: each GPU gets a nonce range spaced far apart
+        let result: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
+        let nonce_spacing: u64 = (self.batch_size as u64) * 1_000_000; // huge gap per GPU
+
+        std::thread::scope(|s| {
+            for (gpu_idx, dev) in self.devices.iter().enumerate() {
+                let stop_flag = &stop_flag;
+                let attempts_counter = &attempts_counter;
+                let result = &result;
+                let gpu_start = start_nonce.wrapping_add((gpu_idx as u64) * nonce_spacing);
+
+                s.spawn(move || {
+                    match mine_on_device(
+                        dev,
+                        challenge,
+                        difficulty,
+                        gpu_start,
+                        Arc::clone(stop_flag),
+                        Arc::clone(attempts_counter),
+                    ) {
+                        Ok(Some(nonce)) => {
+                            let mut r = result.lock().unwrap();
+                            if r.is_none() {
+                                *r = Some(nonce);
+                            }
+                            stop_flag.store(true, Ordering::Relaxed);
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            eprintln!("❌ GPU {} error: {e}", gpu_idx);
+                        }
+                    }
+                });
+            }
+        });
+
+        Ok(result.into_inner().unwrap())
     }
 }
 
-/// Read the 32-byte challenge as 4 little-endian u64 words (matches the lane
-/// layout the kernel expects).
+/// Run mining loop on a single GPU device.
+fn mine_on_device(
+    dev: &GpuDevice,
+    challenge: B256,
+    difficulty: U256,
+    start_nonce: u64,
+    stop_flag: Arc<AtomicBool>,
+    attempts_counter: Arc<AtomicU64>,
+) -> Result<Option<u64>> {
+    let cw = split_challenge_le(&challenge);
+    let dw = split_difficulty_be(difficulty);
+
+    let found_nonce = Buffer::<u64>::builder()
+        .queue(dev.queue.clone())
+        .flags(flags::MEM_READ_WRITE)
+        .len(1)
+        .copy_host_slice(&[0u64])
+        .build()?;
+    let found_flag = Buffer::<i32>::builder()
+        .queue(dev.queue.clone())
+        .flags(flags::MEM_READ_WRITE)
+        .len(1)
+        .copy_host_slice(&[0i32])
+        .build()?;
+
+    let mut nonce_base: u64 = start_nonce;
+    loop {
+        if stop_flag.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+
+        found_flag.write(&[0i32][..]).enq()?;
+        found_nonce.write(&[0u64][..]).enq()?;
+
+        let kernel = Kernel::builder()
+            .program(&dev.program)
+            .name("mine_keccak")
+            .queue(dev.queue.clone())
+            .global_work_size(dev.batch_size)
+            .arg(cw[0]).arg(cw[1]).arg(cw[2]).arg(cw[3])
+            .arg(dw[0]).arg(dw[1]).arg(dw[2]).arg(dw[3])
+            .arg(nonce_base)
+            .arg(&found_nonce)
+            .arg(&found_flag)
+            .build()?;
+
+        unsafe { kernel.enq()?; }
+        dev.queue.finish()?;
+
+        attempts_counter.fetch_add(dev.batch_size as u64, Ordering::Relaxed);
+
+        let mut flag = [0i32];
+        found_flag.read(&mut flag[..]).enq()?;
+        if flag[0] != 0 {
+            let mut got = [0u64];
+            found_nonce.read(&mut got[..]).enq()?;
+            let nonce = got[0];
+
+            // CPU-verify before returning
+            let h = cpu_hash(&challenge, U256::from(nonce));
+            if U256::from_be_bytes::<32>(h.0) < difficulty {
+                return Ok(Some(nonce));
+            } else {
+                eprintln!(
+                    "⚠️  GPU reported nonce {} but CPU verify failed — skipping batch",
+                    nonce
+                );
+            }
+        }
+
+        nonce_base = nonce_base.wrapping_add(dev.batch_size as u64);
+        std::thread::sleep(Duration::from_micros(1));
+    }
+}
+
+/// Self-test a single device.
+fn self_test_device(dev: &GpuDevice) -> Result<()> {
+    let challenge = B256::from(*b"abcdefghijklmnopqrstuvwxyz012345");
+    let difficulty = U256::MAX;
+    let nonce_base: u64 = 12345;
+
+    let (cw, dw) = (split_challenge_le(&challenge), split_difficulty_be(difficulty));
+
+    let found_nonce = Buffer::<u64>::builder()
+        .queue(dev.queue.clone())
+        .flags(flags::MEM_READ_WRITE)
+        .len(1)
+        .copy_host_slice(&[0u64])
+        .build()?;
+    let found_flag = Buffer::<i32>::builder()
+        .queue(dev.queue.clone())
+        .flags(flags::MEM_READ_WRITE)
+        .len(1)
+        .copy_host_slice(&[0i32])
+        .build()?;
+
+    let kernel = Kernel::builder()
+        .program(&dev.program)
+        .name("mine_keccak")
+        .queue(dev.queue.clone())
+        .global_work_size(1usize)
+        .arg(cw[0]).arg(cw[1]).arg(cw[2]).arg(cw[3])
+        .arg(dw[0]).arg(dw[1]).arg(dw[2]).arg(dw[3])
+        .arg(nonce_base)
+        .arg(&found_nonce)
+        .arg(&found_flag)
+        .build()?;
+
+    unsafe { kernel.enq()?; }
+    dev.queue.finish()?;
+
+    let mut flag = [0i32];
+    found_flag.read(&mut flag[..]).enq()?;
+    if flag[0] == 0 {
+        return Err(eyre!("GPU did not report any hit against MAX difficulty"));
+    }
+
+    let mut got = [0u64];
+    found_nonce.read(&mut got[..]).enq()?;
+    if got[0] != nonce_base {
+        return Err(eyre!(
+            "GPU reported nonce {} but expected {}",
+            got[0],
+            nonce_base
+        ));
+    }
+
+    let cpu_h = cpu_hash(&challenge, U256::from(nonce_base));
+    if !(U256::from_be_bytes::<32>(cpu_h.0) < difficulty) {
+        return Err(eyre!("sanity: CPU hash >= MAX difficulty"));
+    }
+
+    Ok(())
+}
+
+/// Read the 32-byte challenge as 4 little-endian u64 words.
 fn split_challenge_le(challenge: &B256) -> [u64; 4] {
     let b = challenge.as_slice();
     [

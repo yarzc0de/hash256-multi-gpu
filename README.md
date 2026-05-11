@@ -1,90 +1,87 @@
-# HASH Token CPU Miner (Rust)
+# HASH Token GPU Miner (Rust) — Multi-GPU Edition
 
-Port Rust dari `miner.js` di folder induk. Native, multi-threaded, dan jauh lebih cepat dari versi Node.js.
+Fork dari [mrfunntastiic/hash256-cli-with-gpu](https://github.com/mrfunntastiic/hash256-cli-with-gpu) dengan **multi-GPU support** — semua GPU di sistem langsung kepake parallel.
 
-## Kenapa Rust?
+## Fitur Tambahan
 
-| Hal | Node.js (`miner.js`) | Rust (di sini) |
-|---|---|---|
-| Hashing | single-threaded JS | semua core via `std::thread::scope` |
-| Per-attempt cost | `await contract.currentEpoch()` per nonce (RPC roundtrip!) | murni CPU, RPC-nya cuma di-poll tiap 15 detik |
-| Hash rate (laptop 8-core) | ~1k–5k H/s | ~ratusan ribu – jutaan H/s |
-| Binary | butuh Node + 200 MB `node_modules` | satu binary statis |
+- ✅ **Multi-GPU**: Otomatis detect & pakai SEMUA GPU yang tersedia
+- ✅ **Per-GPU threading**: Setiap GPU jalan di thread terpisah, nonce range berbeda
+- ✅ **GPU_INDEX**: Opsional pilih GPU tertentu saja
+- ✅ **Backward compatible**: Single GPU tetap jalan normal tanpa overhead
 
-## Requirements
+## Quick Start
 
-- Rust toolchain (>= 1.75) — install via [rustup.rs](https://rustup.rs)
-- Wallet Ethereum dengan ETH untuk gas
-- RPC endpoint (default `https://eth.llamarpc.com` — publik, ganti ke Alchemy/Infura punyamu kalau bisa)
-
-## Build
-
-```powershell
-cd rust-miner
-cargo build --release
-```
-
-Binary keluar di `target/release/hash-miner-rs.exe`.
-
-## Run
-
-### Cara 1: env var (paling aman)
-
-PowerShell:
-```powershell
-$env:PRIVATE_KEY = "0xabc..."
-$env:RPC_URL = "https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY"  # optional
-$env:MINER_THREADS = "8"                                        # optional, default = num CPUs
-cargo run --release
-```
-
-Bash:
 ```bash
-PRIVATE_KEY=0xabc... cargo run --release
+# Install Rust + OpenCL
+apt update && apt install -y build-essential pkg-config ocl-icd-opencl-dev nvidia-opencl-dev clinfo git curl
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source ~/.cargo/env
+
+# Clone & build
+git clone https://github.com/yarzc0de/hash256-multi-gpu.git
+cd hash256-multi-gpu
+cargo build --release
+
+# Config
+cp .env.example .env
+nano .env  # isi PRIVATE_KEY
+
+# Run (semua GPU otomatis kepake)
+./target/release/hash-miner-rs
 ```
 
-### Cara 2: prompt interaktif
+## Environment Variables
 
-```powershell
-cargo run --release
-# masukin private key pas diminta (input disembunyiin via rpassword)
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PRIVATE_KEY` | (required) | Wallet private key (0x...) |
+| `RPC_URL` | `https://eth.llamarpc.com` | Ethereum RPC endpoint |
+| `GPU` | `1` | Set `1` to enable GPU mining |
+| `GPU_INDEX` | (all) | Use specific GPU only (0-based index) |
+| `GPU_BATCH` | `4194304` | Nonces per dispatch per GPU |
+| `MINER_THREADS` | (all cores) | CPU threads (fallback if no GPU) |
+| `PRIORITY_GWEI` | `5` | EIP-1559 priority fee |
+| `MAX_FEE_GWEI` | `100` | EIP-1559 max fee ceiling |
+| `GAS_LIMIT_OVERRIDE` | (auto) | Fixed gas limit |
+
+## Multi-GPU Usage
+
+```bash
+# Pakai SEMUA GPU (default)
+GPU=1 ./target/release/hash-miner-rs
+
+# Pakai GPU tertentu saja (index 0)
+GPU=1 GPU_INDEX=0 ./target/release/hash-miner-rs
+
+# Custom batch size per GPU
+GPU=1 GPU_BATCH=8388608 ./target/release/hash-miner-rs
 ```
 
-## Konfigurasi
+## Vast.ai Setup
 
-Ada di konstanta atas `src/main.rs`:
+1. Sewa instance dengan multi-GPU (e.g. 4x RTX 3090)
+2. Pilih template PyTorch atau Ubuntu + CUDA
+3. SSH masuk, install deps, clone, build, run
+4. Semua GPU langsung kepake — no manual config needed
 
-- `HASH_CONTRACT_ADDRESS` — `0xAC7b5d06fa1e77D08aea40d46cB7C5923A87A0cc`
-- `DEFAULT_RPC_URL` — di-override pakai env `RPC_URL`
-- `CHAIN_ID` — 1 (Ethereum Mainnet)
-- `EPOCH_POLL_INTERVAL` — 15 detik (seberapa sering cek epoch berubah)
-- `STATS_INTERVAL` — 2 detik (refresh hash rate display)
+## Output Example (4x GPU)
 
-Gas tidak di-hardcode — alloy auto-estimate. Kalau mau force gas, edit bagian `contract.mint(...)` di `main.rs`.
+```
+🔐 HASH Token Miner (Rust) — Multi-GPU Edition
+================================================
 
-## Cara kerja mining
+🎮 GPU Mining — 4 device(s) detected:
+   GPU 0: NVIDIA GeForce RTX 3090
+   GPU 1: NVIDIA GeForce RTX 3090
+   GPU 2: NVIDIA GeForce RTX 3090
+   GPU 3: NVIDIA GeForce RTX 3090
+   Batch size: 4194304 nonces/dispatch/GPU
+✅ All GPU self-tests passed
 
-Sama persis dengan versi JS:
-
-1. **Challenge** = `keccak256(abi.encodePacked(chainId, contract, miner, epoch))`
-2. **Proof** = `keccak256(abi.encodePacked(challenge, nonce)) < currentDifficulty`
-3. **Reward** = `100 HASH >> (totalMints / 100_000)`
-
-Bedanya di Rust:
-- Tiap worker thread mulai dari `start_nonce + tid` dan inkremen pakai `stride = num_threads` — gak ada nonce yang dihash dua kali antar thread.
-- `start_nonce` di-random tiap ronde supaya beberapa miner di wallet yang sama gak buang energi pada nonce yang sama.
-- Watchdog `tokio` task ngecek epoch tiap 15 detik. Begitu epoch ganti, semua worker di-signal stop via `AtomicBool` dan ronde direstart.
-
-## Stop
-
-`Ctrl+C` — bakal signal worker buat berhenti setelah attempt sekarang, terus print statistik akhir.
-
-## Security
-
-- Jangan commit private key. Pakai env var atau prompt.
-- RPC publik bisa rate-limit / di-MITM. Pakai punyamu kalau bisa.
-- Mining butuh ETH untuk gas. Kalau hash rate ketemu solusi tapi gas-mu kurang, tx revert.
+⛏️  Mining epoch 1234 on GPU (4 GPUs)...
+⚡ 22000000000.00 H/s | round   12s | attempts    264000000000
+```
 
 ## License
 
-MIT — risiko ditanggung sendiri.
+MIT
