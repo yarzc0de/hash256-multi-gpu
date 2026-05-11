@@ -1,40 +1,38 @@
-//! GPU mining backend via OpenCL — **Multi-GPU** support.
-//!
-//! Enumerates ALL available OpenCL devices and runs them in parallel.
-//! Each GPU gets its own queue and dispatches batches independently.
+//! GPU mining backend via OpenCL with multi-device support.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use alloy::primitives::{keccak256, B256, U256};
 use eyre::{eyre, Result};
-use ocl::{flags, Buffer, Context, Device, Kernel, Platform, Program, Queue};
+use ocl::{flags, Buffer, Context, Device, Kernel, Platform, Program, Queue, SpatialDims};
 
 const KERNEL_SRC: &str = include_str!("keccak_kernel.cl");
-const DEFAULT_BATCH: usize = 1 << 22; // 4,194,304 nonces/dispatch
 
-/// A single GPU device context ready to mine.
+const DEFAULT_BATCH: usize = 1 << 24;
+
+const LWS: usize = 128;
+
+const ARG_NONCE_BASE: u32 = 8;
+
 struct GpuDevice {
+    #[allow(dead_code)]
+    context: Context,
     queue: Queue,
     program: Program,
     device_name: String,
     batch_size: usize,
 }
 
-/// Multi-GPU miner — holds all detected GPU devices.
 pub struct GpuMiner {
     devices: Vec<GpuDevice>,
     batch_size: usize,
 }
 
 impl GpuMiner {
-    /// Initialize OpenCL GPUs.
-    /// - `gpu_indices = None` → use ALL GPUs
-    /// - `gpu_indices = Some(vec![0])` → use only GPU 0
-    /// - `gpu_indices = Some(vec![0, 1])` → use GPU 0 and 1
     pub fn new(batch_size: Option<usize>, gpu_indices: Option<Vec<usize>>) -> Result<Self> {
-        let batch_size = batch_size.unwrap_or(DEFAULT_BATCH);
+        let raw_batch = batch_size.unwrap_or(DEFAULT_BATCH);
+        let batch_size = raw_batch.div_ceil(LWS) * LWS;
 
         let platform = Platform::default();
         let all_devices = Device::list_all(platform)
@@ -73,9 +71,14 @@ impl GpuMiner {
             let program = Program::builder()
                 .src(KERNEL_SRC)
                 .devices(*device)
+                // `-cl-fast-relaxed-math` relaxes FP rounding semantics; the kernel
+                // is integer-only, so this is a zero-semantics change but lets
+                // NVIDIA's OpenCL compiler emit tighter PTX on the int paths too.
+                .cmplr_opt("-cl-mad-enable -cl-no-signed-zeros -cl-fast-relaxed-math")
                 .build(&context)?;
 
             devices.push(GpuDevice {
+                context,
                 queue,
                 program,
                 device_name,
@@ -94,7 +97,6 @@ impl GpuMiner {
         self.devices.len()
     }
 
-    /// Legacy compat
     pub fn device_name(&self) -> String {
         self.devices
             .iter()
@@ -107,7 +109,6 @@ impl GpuMiner {
         self.batch_size
     }
 
-    /// Self-test ALL GPUs.
     pub fn self_test(&self) -> Result<()> {
         for (i, dev) in self.devices.iter().enumerate() {
             self_test_device(dev)
@@ -116,8 +117,6 @@ impl GpuMiner {
         Ok(())
     }
 
-    /// Mine across ALL GPUs in parallel threads.
-    /// Each GPU gets a different nonce range (offset by device index * batch_size * large_stride).
     pub fn mine(
         &self,
         challenge: B256,
@@ -131,28 +130,28 @@ impl GpuMiner {
             return Ok(None);
         }
 
-        // Single GPU — no threading overhead
         if num_gpus == 1 {
             return mine_on_device(
                 &self.devices[0],
                 challenge,
                 difficulty,
                 start_nonce,
+                1,
                 stop_flag,
                 attempts_counter,
             );
         }
 
-        // Multi-GPU: each GPU gets a nonce range spaced far apart
         let result: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
-        let nonce_spacing: u64 = (self.batch_size as u64) * 1_000_000; // huge gap per GPU
+        let batch = self.batch_size as u64;
+        let stride = num_gpus as u64;
 
         std::thread::scope(|s| {
             for (gpu_idx, dev) in self.devices.iter().enumerate() {
                 let stop_flag = &stop_flag;
                 let attempts_counter = &attempts_counter;
                 let result = &result;
-                let gpu_start = start_nonce.wrapping_add((gpu_idx as u64) * nonce_spacing);
+                let gpu_start = start_nonce.wrapping_add((gpu_idx as u64) * batch);
 
                 s.spawn(move || {
                     match mine_on_device(
@@ -160,6 +159,7 @@ impl GpuMiner {
                         challenge,
                         difficulty,
                         gpu_start,
+                        stride,
                         Arc::clone(stop_flag),
                         Arc::clone(attempts_counter),
                     ) {
@@ -183,12 +183,12 @@ impl GpuMiner {
     }
 }
 
-/// Run mining loop on a single GPU device.
 fn mine_on_device(
     dev: &GpuDevice,
     challenge: B256,
     difficulty: U256,
     start_nonce: u64,
+    stride_multiplier: u64,
     stop_flag: Arc<AtomicBool>,
     attempts_counter: Arc<AtomicU64>,
 ) -> Result<Option<u64>> {
@@ -208,31 +208,44 @@ fn mine_on_device(
         .copy_host_slice(&[0i32])
         .build()?;
 
+    let kernel = Kernel::builder()
+        .program(&dev.program)
+        .name("mine_keccak")
+        .queue(dev.queue.clone())
+        .global_work_size(SpatialDims::One(dev.batch_size))
+        .local_work_size(SpatialDims::One(LWS))
+        .arg(cw[0])
+        .arg(cw[1])
+        .arg(cw[2])
+        .arg(cw[3])
+        .arg(dw[0])
+        .arg(dw[1])
+        .arg(dw[2])
+        .arg(dw[3])
+        .arg(0u64)
+        .arg(&found_nonce)
+        .arg(&found_flag)
+        .build()?;
+
+    let advance = (dev.batch_size as u64).saturating_mul(stride_multiplier);
     let mut nonce_base: u64 = start_nonce;
+    let batch_u64 = dev.batch_size as u64;
+
     loop {
         if stop_flag.load(Ordering::Relaxed) {
             return Ok(None);
         }
 
         found_flag.write(&[0i32][..]).enq()?;
-        found_nonce.write(&[0u64][..]).enq()?;
 
-        let kernel = Kernel::builder()
-            .program(&dev.program)
-            .name("mine_keccak")
-            .queue(dev.queue.clone())
-            .global_work_size(dev.batch_size)
-            .arg(cw[0]).arg(cw[1]).arg(cw[2]).arg(cw[3])
-            .arg(dw[0]).arg(dw[1]).arg(dw[2]).arg(dw[3])
-            .arg(nonce_base)
-            .arg(&found_nonce)
-            .arg(&found_flag)
-            .build()?;
+        kernel.set_arg(ARG_NONCE_BASE, nonce_base)?;
 
-        unsafe { kernel.enq()?; }
+        unsafe {
+            kernel.enq()?;
+        }
         dev.queue.finish()?;
 
-        attempts_counter.fetch_add(dev.batch_size as u64, Ordering::Relaxed);
+        attempts_counter.fetch_add(batch_u64, Ordering::Relaxed);
 
         let mut flag = [0i32];
         found_flag.read(&mut flag[..]).enq()?;
@@ -241,7 +254,6 @@ fn mine_on_device(
             found_nonce.read(&mut got[..]).enq()?;
             let nonce = got[0];
 
-            // CPU-verify before returning
             let h = cpu_hash(&challenge, U256::from(nonce));
             if U256::from_be_bytes::<32>(h.0) < difficulty {
                 return Ok(Some(nonce));
@@ -253,12 +265,10 @@ fn mine_on_device(
             }
         }
 
-        nonce_base = nonce_base.wrapping_add(dev.batch_size as u64);
-        std::thread::sleep(Duration::from_micros(1));
+        nonce_base = nonce_base.wrapping_add(advance);
     }
 }
 
-/// Self-test a single device.
 fn self_test_device(dev: &GpuDevice) -> Result<()> {
     let challenge = B256::from(*b"abcdefghijklmnopqrstuvwxyz012345");
     let difficulty = U256::MAX;
@@ -279,19 +289,29 @@ fn self_test_device(dev: &GpuDevice) -> Result<()> {
         .copy_host_slice(&[0i32])
         .build()?;
 
+    // Leaving LWS unset here: a 1-item GWS with LWS=128 is illegal under
+    // clEnqueueNDRangeKernel.
     let kernel = Kernel::builder()
         .program(&dev.program)
         .name("mine_keccak")
         .queue(dev.queue.clone())
         .global_work_size(1usize)
-        .arg(cw[0]).arg(cw[1]).arg(cw[2]).arg(cw[3])
-        .arg(dw[0]).arg(dw[1]).arg(dw[2]).arg(dw[3])
+        .arg(cw[0])
+        .arg(cw[1])
+        .arg(cw[2])
+        .arg(cw[3])
+        .arg(dw[0])
+        .arg(dw[1])
+        .arg(dw[2])
+        .arg(dw[3])
         .arg(nonce_base)
         .arg(&found_nonce)
         .arg(&found_flag)
         .build()?;
 
-    unsafe { kernel.enq()?; }
+    unsafe {
+        kernel.enq()?;
+    }
     dev.queue.finish()?;
 
     let mut flag = [0i32];
@@ -318,7 +338,6 @@ fn self_test_device(dev: &GpuDevice) -> Result<()> {
     Ok(())
 }
 
-/// Read the 32-byte challenge as 4 little-endian u64 words.
 fn split_challenge_le(challenge: &B256) -> [u64; 4] {
     let b = challenge.as_slice();
     [
@@ -329,7 +348,6 @@ fn split_challenge_le(challenge: &B256) -> [u64; 4] {
     ]
 }
 
-/// Split a uint256 into 4 big-endian u64 words (index 0 = most significant).
 fn split_difficulty_be(d: U256) -> [u64; 4] {
     let b = d.to_be_bytes::<32>();
     [
@@ -340,7 +358,6 @@ fn split_difficulty_be(d: U256) -> [u64; 4] {
     ]
 }
 
-/// CPU reference for keccak256(abi.encode(bytes32 challenge, uint256 nonce)).
 fn cpu_hash(challenge: &B256, nonce: U256) -> B256 {
     let mut buf = [0u8; 64];
     buf[..32].copy_from_slice(challenge.as_slice());
