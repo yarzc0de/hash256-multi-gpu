@@ -11,7 +11,7 @@ const KERNEL_SRC: &str = include_str!("keccak_kernel.cl");
 
 const DEFAULT_BATCH: usize = 1 << 24;
 
-const LWS: usize = 128;
+const DEFAULT_LWS: usize = 128;
 
 const ARG_NONCE_BASE: u32 = 8;
 
@@ -22,6 +22,7 @@ struct GpuDevice {
     program: Program,
     device_name: String,
     batch_size: usize,
+    lws: usize,
 }
 
 pub struct GpuMiner {
@@ -31,8 +32,26 @@ pub struct GpuMiner {
 
 impl GpuMiner {
     pub fn new(batch_size: Option<usize>, gpu_indices: Option<Vec<usize>>) -> Result<Self> {
+        // GPU_LWS overrides work-group size for tuning experiments.
+        // Must divide batch_size; we round up to satisfy that.
+        let lws = std::env::var("GPU_LWS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&v| v > 0 && v <= 1024)
+            .unwrap_or(DEFAULT_LWS);
+
         let raw_batch = batch_size.unwrap_or(DEFAULT_BATCH);
-        let batch_size = raw_batch.div_ceil(LWS) * LWS;
+        let batch_size = raw_batch.div_ceil(lws) * lws;
+
+        // USE_MANUAL_ROL64=1 switches the kernel from rotate() builtin back to
+        // manual shift+or ROL64. Escape hatch for drivers that mis-lower the
+        // 64-bit rotate builtin (some NVIDIA OpenCL versions).
+        let use_manual_rol = std::env::var("USE_MANUAL_ROL64").ok().as_deref() == Some("1");
+        let mut cmplr_opts =
+            String::from("-cl-mad-enable -cl-no-signed-zeros -cl-fast-relaxed-math");
+        if use_manual_rol {
+            cmplr_opts.push_str(" -DUSE_MANUAL_ROL64");
+        }
 
         let platform = Platform::default();
         let all_devices = Device::list_all(platform)
@@ -74,7 +93,7 @@ impl GpuMiner {
                 // `-cl-fast-relaxed-math` relaxes FP rounding semantics; the kernel
                 // is integer-only, so this is a zero-semantics change but lets
                 // NVIDIA's OpenCL compiler emit tighter PTX on the int paths too.
-                .cmplr_opt("-cl-mad-enable -cl-no-signed-zeros -cl-fast-relaxed-math")
+                .cmplr_opt(cmplr_opts.as_str())
                 .build(&context)?;
 
             devices.push(GpuDevice {
@@ -83,6 +102,7 @@ impl GpuMiner {
                 program,
                 device_name,
                 batch_size,
+                lws,
             });
         }
 
@@ -213,7 +233,7 @@ fn mine_on_device(
         .name("mine_keccak")
         .queue(dev.queue.clone())
         .global_work_size(SpatialDims::One(dev.batch_size))
-        .local_work_size(SpatialDims::One(LWS))
+        .local_work_size(SpatialDims::One(dev.lws))
         .arg(cw[0])
         .arg(cw[1])
         .arg(cw[2])
