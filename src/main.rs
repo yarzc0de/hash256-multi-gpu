@@ -16,7 +16,7 @@ mod gpu;
 const HASH_CONTRACT_ADDRESS: Address = address!("AC7b5d06fa1e77D08aea40d46cB7C5923A87A0cc");
 const DEFAULT_RPC_URL: &str = "https://eth.llamarpc.com";
 const EPOCH_BLOCKS: u64 = 100;
-const EPOCH_POLL_INTERVAL: Duration = Duration::from_secs(15);
+const EPOCH_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const STATS_INTERVAL: Duration = Duration::from_secs(2);
 const ERA_MINTS: u64 = 100_000;
 
@@ -243,7 +243,15 @@ async fn mine_wallet(
         };
 
         let backend = if gpu_miner.is_some() { "GPU" } else { "CPU" };
-        println!("{} ⛏️  Epoch {} | {} | 0x{}...", tag, epoch, backend, hex_short(challenge.as_slice()));
+        // Estimate expected time to solve
+        let expected_hashes: f64 = if difficulty > U256::ZERO {
+            let diff_f64 = difficulty.to_string().parse::<f64>().unwrap_or(1e60);
+            (2.0_f64.powi(256)) / diff_f64
+        } else {
+            1.0
+        };
+        let est_seconds = expected_hashes / 9.4e9;
+        println!("{} ⛏️  Epoch {} | {} | 0x{}... | est: {:.0}s per solve", tag, epoch, backend, hex_short(challenge.as_slice()), est_seconds);
 
         let start_nonce_u64: u64 = rand::thread_rng().gen();
         let start_nonce = U256::from(start_nonce_u64);
@@ -365,6 +373,7 @@ async fn mine_wallet(
         };
 
         println!("{} 🎉 NONCE FOUND: {} (epoch {})", tag, sol.nonce, sol.epoch);
+        println!("{} ⏱️  Found after {} attempts", tag, session_attempts);
 
         let priority_wei = (priority_gwei * 1e9) as u128;
         let max_fee_wei = (max_fee_gwei * 1e9) as u128;
@@ -391,8 +400,11 @@ async fn mine_wallet(
                                 receipt.block_number.unwrap_or_default(),
                                 success_count
                             );
+                            // Wait briefly for state to propagate before next round
+                            tokio::time::sleep(Duration::from_secs(2)).await;
                         } else {
-                            println!("{} ❌ Reverted", tag);
+                            println!("{} ❌ Reverted (epoch may have changed or block cap reached)", tag);
+                            // Don't wait on revert — immediately try next round
                         }
                     }
                     Err(e) => eprintln!("{} ❌ Receipt error: {e}", tag),
