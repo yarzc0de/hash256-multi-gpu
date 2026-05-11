@@ -29,9 +29,11 @@ pub struct GpuMiner {
 }
 
 impl GpuMiner {
-    /// Initialize ALL available OpenCL GPUs.
-    /// If `gpu_index` is Some, only use that specific device index.
-    pub fn new(batch_size: Option<usize>, gpu_index: Option<usize>) -> Result<Self> {
+    /// Initialize OpenCL GPUs.
+    /// - `gpu_indices = None` → use ALL GPUs
+    /// - `gpu_indices = Some(vec![0])` → use only GPU 0
+    /// - `gpu_indices = Some(vec![0, 1])` → use GPU 0 and 1
+    pub fn new(batch_size: Option<usize>, gpu_indices: Option<Vec<usize>>) -> Result<Self> {
         let batch_size = batch_size.unwrap_or(DEFAULT_BATCH);
 
         let platform = Platform::default();
@@ -42,15 +44,19 @@ impl GpuMiner {
             return Err(eyre!("no OpenCL devices found"));
         }
 
-        let selected_devices: Vec<Device> = if let Some(idx) = gpu_index {
-            if idx >= all_devices.len() {
-                return Err(eyre!(
-                    "GPU_INDEX={} but only {} devices available",
-                    idx,
-                    all_devices.len()
-                ));
+        let selected_devices: Vec<Device> = if let Some(indices) = gpu_indices {
+            let mut devs = Vec::new();
+            for idx in &indices {
+                if *idx >= all_devices.len() {
+                    return Err(eyre!(
+                        "GPU index {} but only {} devices available",
+                        idx,
+                        all_devices.len()
+                    ));
+                }
+                devs.push(all_devices[*idx]);
             }
-            vec![all_devices[idx]]
+            devs
         } else {
             all_devices
         };

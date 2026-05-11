@@ -156,7 +156,7 @@ async fn mine_wallet(
     wallet_idx: usize,
     raw_key: String,
     rpc_url_str: String,
-    gpu_index: Option<usize>,
+    gpu_indices: Option<Vec<usize>>,
     num_threads: usize,
     shutdown: Arc<AtomicBool>,
     gpu_batch: Option<usize>,
@@ -184,8 +184,8 @@ async fn mine_wallet(
 
     // --- GPU setup for this wallet ---
     #[cfg(feature = "gpu")]
-    let gpu_miner: Option<Arc<gpu::GpuMiner>> = if gpu_index.is_some() || std::env::var("GPU").ok().as_deref() == Some("1") {
-        match gpu::GpuMiner::new(gpu_batch, gpu_index) {
+    let gpu_miner: Option<Arc<gpu::GpuMiner>> = if gpu_indices.is_some() || std::env::var("GPU").ok().as_deref() == Some("1") {
+        match gpu::GpuMiner::new(gpu_batch, gpu_indices) {
             Ok(g) => {
                 println!("{} 🎮 GPU: {} ({} device(s))", tag, g.device_name(), g.device_count());
                 match g.self_test() {
@@ -481,25 +481,38 @@ async fn main() -> Result<()> {
     // Strategy: distribute GPUs evenly across wallets
     // e.g. 2 wallets, 4 GPUs → wallet 0 gets GPU 0,1 — wallet 1 gets GPU 2,3
     // e.g. 2 wallets, 2 GPUs → wallet 0 gets GPU 0 — wallet 1 gets GPU 1
-    // e.g. 1 wallet, 2 GPUs → wallet 0 gets all GPUs (gpu_index=None)
-    let gpu_assignments: Vec<Option<usize>> = if total_gpus == 0 || num_wallets == 0 {
+    // e.g. 1 wallet, 2 GPUs → wallet 0 gets all GPUs (None)
+    let gpu_assignments: Vec<Option<Vec<usize>>> = if total_gpus == 0 || num_wallets == 0 {
         vec![None; num_wallets]
     } else if num_wallets == 1 {
         // Single wallet gets ALL GPUs
         vec![None]
     } else if num_wallets >= total_gpus {
         // More wallets than GPUs: each wallet gets 1 GPU (round-robin)
-        (0..num_wallets).map(|i| Some(i % total_gpus)).collect()
+        (0..num_wallets).map(|i| Some(vec![i % total_gpus])).collect()
     } else {
-        // More GPUs than wallets: each wallet gets 1 GPU (for now)
-        // TODO: could split GPU ranges per wallet
-        (0..num_wallets).map(|i| Some(i)).collect()
+        // More GPUs than wallets: distribute evenly
+        // e.g. 4 GPUs / 2 wallets = 2 GPUs each
+        let gpus_per_wallet = total_gpus / num_wallets;
+        let remainder = total_gpus % num_wallets;
+        let mut assignments = Vec::new();
+        let mut gpu_cursor = 0;
+        for i in 0..num_wallets {
+            let count = gpus_per_wallet + if i < remainder { 1 } else { 0 };
+            let indices: Vec<usize> = (gpu_cursor..gpu_cursor + count).collect();
+            assignments.push(Some(indices));
+            gpu_cursor += count;
+        }
+        assignments
     };
 
     println!("\n🚀 Starting {} mining worker(s)...", num_wallets);
     for (i, gpu) in gpu_assignments.iter().enumerate() {
         match gpu {
-            Some(idx) => println!("   Wallet {} → GPU {}", i + 1, idx),
+            Some(indices) => {
+                let gpu_str: Vec<String> = indices.iter().map(|x| x.to_string()).collect();
+                println!("   Wallet {} → GPU [{}]", i + 1, gpu_str.join(", "));
+            }
             None => println!("   Wallet {} → All GPUs", i + 1),
         }
     }
@@ -523,13 +536,13 @@ async fn main() -> Result<()> {
     for (i, key) in keys.into_iter().enumerate() {
         let rpc = rpc_url_str.clone();
         let shutdown = Arc::clone(&shutdown);
-        let gpu_idx = gpu_assignments[i];
+        let gpu_idxs = gpu_assignments[i].clone();
 
         let handle = tokio::spawn(mine_wallet(
             i + 1,
             key,
             rpc,
-            gpu_idx,
+            gpu_idxs,
             num_threads,
             shutdown,
             gpu_batch,
