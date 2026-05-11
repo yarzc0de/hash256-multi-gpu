@@ -189,14 +189,15 @@ async fn mine_wallet(
             Ok(g) => {
                 println!("{} 🎮 GPU: {} ({} device(s))", tag, g.device_name(), g.device_count());
                 match g.self_test() {
-                    Ok(()) => println!("{} ✅ GPU self-test passed", tag),
+                    Ok(()) => {
+                        println!("{} ✅ GPU self-test passed", tag);
+                        Some(Arc::new(g))
+                    }
                     Err(e) => {
                         eprintln!("{} ⚠️  GPU self-test failed: {e}, falling back to CPU", tag);
-                        None?;
-                        unreachable!()
+                        None
                     }
                 }
-                Some(Arc::new(g))
             }
             Err(e) => {
                 eprintln!("{} ⚠️  GPU init failed: {e}, using CPU", tag);
